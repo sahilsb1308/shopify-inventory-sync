@@ -953,24 +953,20 @@ async function readKitsSheet(token) {
 async function writeProjectedDemand(token, skuRows, childToKits, kitParentSkus) {
   const lastRow  = skuRows[skuRows.length - 1].row;
 
-  // Batch-read all columns needed for derived calculations
+  // Read only what's needed: O (NPD text), Q (promo), U (DRR), K (sold), AE (NPD flag), R (bestseller from sheet), AA read via skuRows
   const ranges = [
     `${SHEET_TAB}!O${DATA_START_ROW}:O${lastRow}`,   // NPD text
     `${SHEET_TAB}!Q${DATA_START_ROW}:Q${lastRow}`,   // Promo Q
     `${SHEET_TAB}!U${DATA_START_ROW}:U${lastRow}`,   // DRR (just written)
     `${SHEET_TAB}!K${DATA_START_ROW}:K${lastRow}`,   // Net Sold (just written)
     `${SHEET_TAB}!AE${DATA_START_ROW}:AE${lastRow}`, // NPD flag
-    `${SHEET_TAB}!N${DATA_START_ROW}:N${lastRow}`,   // Gross Sales (just written)
-    `${SHEET_TAB}!G${DATA_START_ROW}:G${lastRow}`,   // Current Stock (just written)
-    `${SHEET_TAB}!I${DATA_START_ROW}:I${lastRow}`,   // RTO Stock
-    `${SHEET_TAB}!J${DATA_START_ROW}:J${lastRow}`,   // Inward Stock
-    `${SHEET_TAB}!S${DATA_START_ROW}:S${lastRow}`,   // Last Month's Projection
+    `${SHEET_TAB}!R${DATA_START_ROW}:R${lastRow}`,   // Bestseller (sheet formula)
   ];
   const batchUrl = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values:batchGet?${ranges.map(r => `ranges=${encodeURIComponent(r)}`).join("&")}`;
   const batchRes = await withRetry(() => httpsGet(batchUrl, { Authorization: `Bearer ${token}` }));
   if (batchRes.statusCode !== 200) throw new Error(`Demand cols read error ${batchRes.statusCode}: ${batchRes.body}`);
 
-  const [oVals, qVals, uVals, kVals, aeVals, nVals, gVals, iVals, jVals, sVals] =
+  const [oVals, qVals, uVals, kVals, aeVals, rVals] =
     (JSON.parse(batchRes.body).valueRanges ?? []).map(vr => vr.values ?? []);
 
   // Build SKU → K and prefix → K lookups for kit contribution
@@ -984,117 +980,45 @@ async function writeProjectedDemand(token, skuRows, childToKits, kitParentSkus) 
     if (!(prefix in prefixToK)) prefixToK[prefix] = k;
   }
 
-  // Pre-compute total N and median N for bestseller + revenue contribution
-  const nNonBlank = skuRows
-    .map(({ row }) => { const raw = (nVals[row - DATA_START_ROW]?.[0] ?? "").trim(); return raw !== "" ? parseFloat(raw) || 0 : null; })
-    .filter(v => v !== null);
-  const totalN  = nNonBlank.reduce((s, v) => s + v, 0);
-  const nMedian = calcMedian(nNonBlank);
-
   const totalRows = lastRow - DATA_START_ROW + 1;
-  const colM  = Array.from({ length: totalRows }, () => [0]);
-  const colR  = Array.from({ length: totalRows }, () => [0]);
-  const colT  = Array.from({ length: totalRows }, () => [0]);
-  const colV  = Array.from({ length: totalRows }, () => [0]);
-  const colW  = Array.from({ length: totalRows }, () => [""]);
-  const colX  = Array.from({ length: totalRows }, () => [""]);
-  const colY  = Array.from({ length: totalRows }, () => [0]);
-  const colZ  = Array.from({ length: totalRows }, () => [""]);
-  const colAA = Array.from({ length: totalRows }, () => ["P3"]);
-  const colAB = Array.from({ length: totalRows }, () => [0]);
-  const colAC = Array.from({ length: totalRows }, () => [0]);
-  const colAD = Array.from({ length: totalRows }, () => [""]);
+  const colW = Array.from({ length: totalRows }, () => [""]);
+  const colX = Array.from({ length: totalRows }, () => [""]);
 
   for (const { sku, row, priority } of skuRows) {
-    const i       = row - DATA_START_ROW;
-    const drrRaw  = (uVals[i]?.[0] ?? "").trim();
-    const drr     = drrRaw === "" ? null : (parseFloat(drrRaw) || 0);
-    const npd     = (oVals[i]?.[0] ?? "").trim();
-    const npdFlag = (aeVals[i]?.[0] ?? "").trim();
-    const promoQ  = (qVals[i]?.[0] ?? "").trim();
-    const nRaw    = (nVals[i]?.[0] ?? "").trim();
-    const gRaw    = (gVals[i]?.[0] ?? "").trim();
-    const iRaw    = (iVals[i]?.[0] ?? "").trim();
-    const jRaw    = (jVals[i]?.[0] ?? "").trim();
-    const sRaw    = (sVals[i]?.[0] ?? "").trim();
-    const kVal    = parseFloat((kVals[i]?.[0] ?? "0").replace(/,/g, "")) || 0;
-    const nVal    = nRaw !== "" ? parseFloat(nRaw) || 0 : 0;
-    const gVal    = gRaw !== "" ? parseFloat(gRaw) || 0 : 0;
-    const sVal    = sRaw !== "" ? parseFloat(sRaw) || 0 : 0;
-    const isChild = sku in childToKits;
+    const i        = row - DATA_START_ROW;
+    const drrRaw   = (uVals[i]?.[0] ?? "").trim();
+    const drr      = drrRaw === "" ? null : (parseFloat(drrRaw) || 0);
+    const npd      = (oVals[i]?.[0] ?? "").trim();
+    const npdFlag  = (aeVals[i]?.[0] ?? "").trim();
+    const promoQ   = (qVals[i]?.[0] ?? "").trim();
+    const promoR   = (rVals[i]?.[0] ?? "").trim();   // R from sheet formula
+    const isChild  = sku in childToKits;
 
-    // Col R — Bestseller: 1 if N ≥ median of all non-blank N values
-    const isBestseller = nRaw !== "" && nVal >= nMedian ? 1 : 0;
-    colR[i] = [isBestseller];
+    // No DRR and not a kit child → blank
+    if (drr === null && !isChild) continue;
 
-    // Col T — Total Available Stock = G + I + J (0 if any blank)
-    if (gRaw === "" || iRaw === "" || jRaw === "") {
-      colT[i] = [0];
-    } else {
-      colT[i] = [(parseFloat(gRaw) || 0) + (parseFloat(iRaw) || 0) + (parseFloat(jRaw) || 0)];
+    // Kit parent → W=0, X=0
+    if (kitParentSkus.has(skuPrefix(sku)) || kitParentSkus.has(sku)) {
+      colW[i] = [0]; colX[i] = [0];
+      continue;
     }
 
-    // Col AB — Revenue Contribution %
-    const abVal = nRaw !== "" && totalN > 0 ? parseFloat(((nVal / totalN) * 100).toFixed(4)) : 0;
-    colAB[i] = [abVal];
-
-    // Col AA — Priority (computed from AE, Q, AB — in that order)
-    let computedPriority;
-    try {
-      if      (Number(npdFlag) === 1) computedPriority = "P0";
-      else if (Number(promoQ)  === 1) computedPriority = "P0";
-      else if (abVal > 1)             computedPriority = "P0";
-      else if (abVal >= 0.44)         computedPriority = "P1";
-      else if (abVal >= 0.2)          computedPriority = "P2";
-      else                            computedPriority = "P3";
-    } catch (_) { computedPriority = "P3"; }
-    colAA[i] = [computedPriority];
-
-    // Col M — Revenue Multiplier (uses computedPriority, not stale sheet AA)
+    // Multiplier using sheet formula values for R (bestseller) and AA (priority)
     const pMap = { P0: 1.5, P1: 1.3, P2: 1.2, P3: 1.1 };
-    const mScore = Math.max(
+    const multiplier = Math.max(
       Number(npdFlag) === 1           ? 6   : 0,
       npd.toUpperCase() === "NPD"     ? 1.8 : 0,
       Number(promoQ) === 1            ? 1.5 : 0,
-      isBestseller === 1              ? 1.2 : 0,
-      pMap[computedPriority] ?? 1,
+      Number(promoR) === 1            ? 1.2 : 0,
+      pMap[priority?.trim().toUpperCase()] ?? 1,
     );
-    colM[i] = [mScore];
-
-    // Col AC — Fill Rate = (K + G) / S
-    colAC[i] = [sVal > 0 ? parseFloat(((kVal + gVal) / sVal).toFixed(4)) : 0];
-
-    // Col V — Days of Inventory = G / DRR
-    const doiVal = drr && drr > 0 && gVal > 0 ? parseFloat((gVal / drr).toFixed(2)) : 0;
-    colV[i] = drr !== null ? [doiVal] : [""];
-
-    // Col Z — Stock Status
-    colZ[i] = [drr !== null ? calcStockStatus(doiVal) : ""];
-
-    // No DRR and not a kit child → blank demand columns
-    if (drr === null && !isChild) { colW[i] = [""]; colX[i] = [""]; colAD[i] = [""]; continue; }
-
-    // Kit parent → only W and X are 0; all other columns already computed above
-    const isKitParent = kitParentSkus.has(skuPrefix(sku)) || kitParentSkus.has(sku);
-    if (isKitParent) {
-      colW[i] = [0]; colX[i] = [0];
-      colY[i] = [0]; colAD[i] = [0];
-      continue;
-    }
 
     const kitContrib = (childToKits[sku] ?? []).reduce((sum, kitSku) => {
       return sum + (skuToK[kitSku] ?? prefixToK[skuPrefix(kitSku)] ?? 0);
     }, 0);
-    const multiplier = mScore;
 
-    const demand7d  = parseFloat((((drr ?? 0) *  7 + kitContrib * 7 / 30) * multiplier).toFixed(2));
-    const demand30d = parseFloat((((drr ?? 0) * 30 + kitContrib          ) * multiplier).toFixed(2));
-    const asp       = kVal > 0 ? nVal / kVal : 0;
-
-    colW[i]  = [demand7d];
-    colX[i]  = [demand30d];
-    colY[i]  = [parseFloat((demand30d * asp).toFixed(2))];
-    colAD[i] = [Math.max(0, parseFloat((demand30d - gVal).toFixed(2)))];
+    colW[i] = [parseFloat((((drr ?? 0) *  7 + kitContrib * 7 / 30) * multiplier).toFixed(2))];
+    colX[i] = [parseFloat((((drr ?? 0) * 30 + kitContrib          ) * multiplier).toFixed(2))];
   }
 
   const make = col => `${SHEET_TAB}!${col}${DATA_START_ROW}:${col}${lastRow}`;
@@ -1103,24 +1027,14 @@ async function writeProjectedDemand(token, skuRows, childToKits, kitParentSkus) 
       "POST",
       `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values:batchUpdate`,
       JSON.stringify({ valueInputOption: "RAW", data: [
-        { range: make(MULTIPLIER_COL),    values: colM  },
-        { range: make(BESTSELLER_COL),    values: colR  },
-        { range: make(TOTAL_STOCK_COL),   values: colT  },
-        { range: make(DOI_COL),           values: colV  },
-        { range: make(DEMAND_7D_COL),     values: colW  },
-        { range: make(DEMAND_COL),        values: colX  },
-        { range: make(PROJ_REV_COL),      values: colY  },
-        { range: make(STOCK_STATUS_COL),  values: colZ  },
-        { range: make(PRIORITY_COL),      values: colAA },
-        { range: make(REV_CONTRIB_COL),   values: colAB },
-        { range: make(FILL_RATE_COL),     values: colAC },
-        { range: make(UNITS_TO_FILL_COL), values: colAD },
+        { range: make(DEMAND_7D_COL), values: colW },
+        { range: make(DEMAND_COL),    values: colX },
       ]}),
       { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
     )
   );
   if (res.statusCode !== 200) throw new Error(`Derived cols write error ${res.statusCode}: ${res.body}`);
-  console.log(`  ✓ Cols M/R/T/V/W/X/Y/Z/AA/AB/AC/AD written for ${skuRows.length} rows`);
+  console.log(`  ✓ Cols W/X written for ${skuRows.length} rows (kit parents zeroed)`);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
